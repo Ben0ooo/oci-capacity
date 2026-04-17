@@ -1,0 +1,70 @@
+name: OCI ARM Capacity
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI SDK
+        run: pip install oci requests -q
+
+      - name: Try to create ARM instance
+        env:
+          OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
+          OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY_BASE64: ${{ secrets.OCI_PRIVATE_KEY_BASE64 }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          python3 << 'EOF'
+          import os, base64, tempfile, oci, requests, json
+          from datetime import datetime
+
+          key_b64 = os.environ['OCI_PRIVATE_KEY_BASE64']
+          key_pem = base64.b64decode(key_b64).decode()
+          with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+              f.write(key_pem)
+              key_file = f.name
+
+          config = {
+              'user': os.environ['OCI_USER_ID'],
+              'fingerprint': os.environ['OCI_FINGERPRINT'],
+              'tenancy': os.environ['OCI_TENANCY_ID'],
+              'region': os.environ['OCI_REGION'],
+              'key_file': key_file,
+          }
+
+          client = oci.core.ComputeClient(config)
+
+          details = oci.core.models.LaunchInstanceDetails(
+              availability_domain=os.environ['OCI_AVAILABILITY_DOMAIN'],
+              compartment_id=config['tenancy'],
+              shape='VM.Standard.A1.Flex',
+              shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=6),
+              source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=os.environ['OCI_IMAGE_ID']),
+              create_vnic_details=oci.core.models.CreateVnicDetails(subnet_id=os.environ['OCI_SUBNET_ID'], assign_public_ip=True),
+              metadata={'ssh_authorized_keys': os.environ['OCI_SSH_PUBLIC_KEY']},
+              display_name=f'coach-beno-{datetime.now().strftime("%Y%m%d-%H%M")}',
+          )
+
+          try:
+              response = client.launch_instance(details)
+              instance = response.data
+              msg = f'VM ARM creee ! IP publique disponible dans quelques minutes.\nOCID: {instance.id}'
+              print(msg)
+              bot = os.environ['TELEGRAM_BOT_API_KEY']
+              chat = os.environ['TELEGRAM_USER_ID']
+              requests.post(f'https://api.telegram.org/bot{bot}/sendMessage', data={'chat_id': chat, 'text': msg})
+          except oci.exceptions.ServiceError as e:
+              print(f'Code: {e.code} - {e.message}')
+          EOF
