@@ -30,7 +30,9 @@ jobs:
           import os, base64, tempfile, oci, requests, json
           from datetime import datetime
 
-          key_b64 = ''.join(os.environ['OCI_PRIVATE_KEY_BASE64'].split())
+          key_b64_raw = os.environ['OCI_PRIVATE_KEY_BASE64']
+          key_b64 = ''.join(key_b64_raw.split())
+          print(f'DEBUG raw_len={len(key_b64_raw)} clean_len={len(key_b64)} mod4={len(key_b64)%4}')
           key_pem = base64.b64decode(key_b64).decode()
           with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
               f.write(key_pem)
