@@ -27,45 +27,94 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           python3 << 'EOF'
-          import os, base64, tempfile, oci, requests, json
+          import os, base64, tempfile, oci, requests, json, traceback
           from datetime import datetime
 
-          key_b64 = ''.join(os.environ['OCI_PRIVATE_KEY_BASE64'].split())
-          key_b64 += '=' * (-len(key_b64) % 4)
-          key_pem = base64.b64decode(key_b64).decode()
-          with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
-              f.write(key_pem)
-              key_file = f.name
+          bot = os.environ.get('TELEGRAM_BOT_API_KEY', '')
+          chat = os.environ.get('TELEGRAM_USER_ID', '')
 
-          config = {
-              'user': os.environ['OCI_USER_ID'],
-              'fingerprint': os.environ['OCI_FINGERPRINT'],
-              'tenancy': os.environ['OCI_TENANCY_ID'],
-              'region': os.environ['OCI_REGION'],
-              'key_file': key_file,
-          }
+          def notify(text, silent=True):
+              if not bot or not chat:
+                  return
+              try:
+                  requests.post(
+                      f'https://api.telegram.org/bot{bot}/sendMessage',
+                      data={'chat_id': chat, 'text': text[:3900], 'disable_notification': silent},
+                      timeout=10,
+                  )
+              except Exception as e:
+                  print(f'Telegram notify failed: {e}')
 
-          client = oci.core.ComputeClient(config)
-
-          details = oci.core.models.LaunchInstanceDetails(
-              availability_domain=os.environ['OCI_AVAILABILITY_DOMAIN'],
-              compartment_id=config['tenancy'],
-              shape='VM.Standard.A1.Flex',
-              shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24),
-              source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=os.environ['OCI_IMAGE_ID']),
-              create_vnic_details=oci.core.models.CreateVnicDetails(subnet_id=os.environ['OCI_SUBNET_ID'], assign_public_ip=True),
-              metadata={'ssh_authorized_keys': os.environ['OCI_SSH_PUBLIC_KEY']},
-              display_name=f'coach-beno-{datetime.now().strftime("%Y%m%d-%H%M")}',
-          )
+          def validate_env():
+              required = ['OCI_USER_ID', 'OCI_TENANCY_ID', 'OCI_FINGERPRINT', 'OCI_REGION',
+                          'OCI_PRIVATE_KEY_BASE64', 'OCI_SUBNET_ID', 'OCI_IMAGE_ID',
+                          'OCI_AVAILABILITY_DOMAIN', 'OCI_SSH_PUBLIC_KEY']
+              missing = [k for k in required if not os.environ.get(k)]
+              if missing:
+                  raise RuntimeError(f'Missing env vars: {missing}')
+              # Sanity checks format
+              checks = {
+                  'OCI_USER_ID': ('ocid1.user', os.environ['OCI_USER_ID']),
+                  'OCI_TENANCY_ID': ('ocid1.tenancy', os.environ['OCI_TENANCY_ID']),
+                  'OCI_SUBNET_ID': ('ocid1.subnet', os.environ['OCI_SUBNET_ID']),
+                  'OCI_IMAGE_ID': ('ocid1.image', os.environ['OCI_IMAGE_ID']),
+              }
+              for name, (prefix, val) in checks.items():
+                  if not val.startswith(prefix):
+                      raise RuntimeError(f'{name} malformed (expected {prefix}...): {val[:40]}')
 
           try:
+              validate_env()
+
+              key_b64 = ''.join(os.environ['OCI_PRIVATE_KEY_BASE64'].split())
+              key_b64 += '=' * (-len(key_b64) % 4)
+              key_pem = base64.b64decode(key_b64).decode()
+              with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+                  f.write(key_pem)
+                  key_file = f.name
+
+              config = {
+                  'user': os.environ['OCI_USER_ID'].strip(),
+                  'fingerprint': os.environ['OCI_FINGERPRINT'].strip(),
+                  'tenancy': os.environ['OCI_TENANCY_ID'].strip(),
+                  'region': os.environ['OCI_REGION'].strip(),
+                  'key_file': key_file,
+              }
+
+              ssh_key = os.environ['OCI_SSH_PUBLIC_KEY'].strip().strip('"\'')
+
+              client = oci.core.ComputeClient(config)
+
+              details = oci.core.models.LaunchInstanceDetails(
+                  availability_domain=os.environ['OCI_AVAILABILITY_DOMAIN'].strip(),
+                  compartment_id=config['tenancy'],
+                  shape='VM.Standard.A1.Flex',
+                  shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24),
+                  source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=os.environ['OCI_IMAGE_ID'].strip()),
+                  create_vnic_details=oci.core.models.CreateVnicDetails(subnet_id=os.environ['OCI_SUBNET_ID'].strip(), assign_public_ip=True),
+                  metadata={'ssh_authorized_keys': ssh_key},
+                  display_name=f'coach-beno-{datetime.now().strftime("%Y%m%d-%H%M")}',
+              )
+
               response = client.launch_instance(details)
               instance = response.data
-              msg = f'VM ARM creee ! IP publique disponible dans quelques minutes.\nOCID: {instance.id}'
+              msg = f'🎉 VM ARM CRÉÉE ! IP publique disponible dans quelques minutes.\nOCID: {instance.id}'
               print(msg)
-              bot = os.environ['TELEGRAM_BOT_API_KEY']
-              chat = os.environ['TELEGRAM_USER_ID']
-              requests.post(f'https://api.telegram.org/bot{bot}/sendMessage', data={'chat_id': chat, 'text': msg})
+              notify(msg, silent=False)
+
           except oci.exceptions.ServiceError as e:
-              print(f'Code: {e.code} - {e.message}')
+              code = getattr(e, 'code', 'UNKNOWN')
+              status = getattr(e, 'status', 'UNKNOWN')
+              message = getattr(e, 'message', str(e))
+              print(f'OCI ServiceError: status={status} code={code} message={message}')
+
+              # Only notify on non-capacity errors (capacity errors are expected)
+              if code not in ('InternalError', 'Out of host capacity', 'LimitExceeded') and 'capacity' not in message.lower():
+                  err_msg = f'⚠️ OCI erreur non-capacity\nCode: {code}\nStatus: {status}\nMsg: {message[:500]}'
+                  notify(err_msg, silent=False)
+
+          except Exception as e:
+              tb = traceback.format_exc()
+              print(f'Unexpected error: {e}\n{tb}')
+              notify(f'⚠️ OCI cron crash: {e}\n{tb[:1500]}', silent=False)
           EOF
